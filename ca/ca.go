@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
@@ -18,6 +19,7 @@ import (
 	"net"
 	"strings"
 	"time"
+  "io/ioutil"
 
 	"github.com/letsencrypt/pebble/v2/acme"
 	"github.com/letsencrypt/pebble/v2/core"
@@ -92,7 +94,7 @@ func makeSubjectKeyID(key crypto.PublicKey) ([]byte, error) {
 	return ski[:], nil
 }
 
-// makeKey and makeRootCert are adapted from MiniCA:
+// makeKey is adapted from MiniCA:
 // https://github.com/jsha/minica/blob/3a621c05b61fa1c24bcb42fbde4b261db504a74f/main.go
 
 // makeKey creates a new 2048 bit RSA private key and a Subject Key Identifier
@@ -201,6 +203,116 @@ func (ca *CAImpl) newIntermediateIssuer(root *issuer, intermediateKey crypto.Sig
 		key:  intermediateKey,
 		cert: ic,
 	}, nil
+}
+
+func (ca *CAImpl) readCAKey(keyFile string) (*rsa.PrivateKey, error) {
+    kf, e := ioutil.ReadFile(keyFile)
+    if e != nil {
+        ca.log.Printf("kfload:", e.Error())
+        return nil, e
+    }
+
+    kpb, kr := pem.Decode(kf)
+    fmt.Println(string(kr))
+
+    key, e := x509.ParsePKCS1PrivateKey(kpb.Bytes)
+    if e != nil {
+        ca.log.Printf("parsekey:", e.Error())
+        return nil, e
+    }
+
+    return key, nil
+}
+
+func (ca *CAImpl) readCACert(certFile string) (*core.Certificate, error) {
+    cf, e := ioutil.ReadFile(certFile)
+    if e != nil {
+        ca.log.Printf("cfload:", e.Error())
+        return nil, e
+    }
+
+    cpb, cr := pem.Decode(cf)
+    fmt.Println(string(cr))
+
+    crt, e := x509.ParseCertificate(cpb.Bytes)
+    if e != nil {
+        ca.log.Printf("parsex509:", e.Error())
+        return nil, e
+    }
+
+    hexSerial := hex.EncodeToString(crt.SerialNumber.Bytes())
+    cert := &core.Certificate{
+        ID:   hexSerial,
+        Cert: crt,
+        DER:  cf,
+    }
+
+    return cert, nil
+}
+
+func (ca *CAImpl) getStaticCAIssuer() (*issuer, error) {
+    cert, e := ca.readCACert("/var/pebble/certs/ca/ca.crt")
+    if e != nil {
+        return nil, e
+    }
+    key, e := ca.readCAKey("/var/pebble/certs/ca/ca.key")
+    if e != nil {
+        return nil, e
+    }
+    return &issuer{
+        key:  key,
+        cert: cert,
+    }, nil
+}
+
+// newChainWithStaticCA generates a new issuance chain, including a root certificate and numIntermediates intermediates (at least 1).
+// The first intermediate will use intermediateKey, intermediateSubject and subjectKeyId.
+// Any intermediates between the first intermediate and the root will have their keys and subjects generated automatically.
+func (ca *CAImpl) newChainWithStaticCA(intermediateKey crypto.Signer, intermediateSubject pkix.Name, subjectKeyID []byte, numIntermediates int) *chain {
+	if numIntermediates <= 0 {
+		panic("At least one intermediate must be present in the certificate chain")
+	}
+
+	chainID := hex.EncodeToString(makeSerial().Bytes()[:3])
+
+	root, err := ca.getStaticCAIssuer()
+	if err != nil {
+		panic(fmt.Sprintf("Error creating new root issuer: %s", err.Error()))
+	}
+
+	// The last N-1 intermediates build a path from the root to the leaf signing certificate.
+	// If numIntermediates is only 1, then no intermediates will be generated here.
+	prev := root
+	intermediates := make([]*issuer, numIntermediates)
+	for i := numIntermediates - 1; i > 0; i-- {
+		k, ski, err := makeKey()
+		if err != nil {
+			panic(fmt.Sprintf("Error creating new intermediate issuer: %v", err))
+		}
+		intermediate, err := ca.newIntermediateIssuer(prev, k, pkix.Name{
+			CommonName: fmt.Sprintf("%s%s #%d", intermediateCAPrefix, chainID, i),
+		}, ski)
+		if err != nil {
+			panic(fmt.Sprintf("Error creating new intermediate issuer: %s", err.Error()))
+		}
+		intermediates[i] = intermediate
+		prev = intermediate
+	}
+
+	// The first issuer is the one which signs the leaf certificates
+	intermediate, err := ca.newIntermediateIssuer(prev, intermediateKey, intermediateSubject, subjectKeyID)
+	if err != nil {
+		panic(fmt.Sprintf("Error creating new intermediate issuer: %s", err.Error()))
+	}
+	intermediates[0] = intermediate
+
+	c := &chain{
+		root:          root,
+		intermediates: intermediates,
+	}
+	ca.log.Printf("Generated issuance chain: %s", c)
+
+	return c
 }
 
 // newChain generates a new issuance chain, including a root certificate and numIntermediates intermediates (at least 1).
@@ -362,7 +474,9 @@ func New(log *log.Logger, db *db.MemoryStore, ocspResponderURL string, alternate
 		panic(fmt.Sprintf("Error creating new intermediate private key: %s", err.Error()))
 	}
 	ca.chains = make([]*chain, 1+alternateRoots)
-	for i := 0; i < len(ca.chains); i++ {
+  ca.chains[0] = ca.newChainWithStaticCA(intermediateKey, intermediateSubject, subjectKeyID, chainLength)
+
+	for i := 1; i < len(ca.chains); i++ {
 		ca.chains[i] = ca.newChain(intermediateKey, intermediateSubject, subjectKeyID, chainLength)
 	}
 
