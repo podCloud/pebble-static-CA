@@ -215,7 +215,7 @@ func (ca *CAImpl) readCAKey(keyFile string) (*rsa.PrivateKey, error) {
     kpb, kr := pem.Decode(kf)
     fmt.Println(string(kr))
 
-    key, e := x509.ParsePKCS1PrivateKey(kpb.Bytes)
+    key, e := x509.ParsePKCS8PrivateKey(kpb.Bytes)
     if e != nil {
         ca.log.Printf("parsekey:", e.Error())
         return nil, e
