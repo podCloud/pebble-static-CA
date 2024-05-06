@@ -220,8 +220,14 @@ func (ca *CAImpl) readCAKey(keyFile string) (*rsa.PrivateKey, error) {
         ca.log.Printf("parsekey:", e.Error())
         return nil, e
     }
+    
 
-    return key, nil
+    rsaKey, ok := key.(*rsa.PrivateKey)
+    if !ok {
+        return nil, errors.New("parsed key is not an RSA private key")
+    }
+
+    return rsaKey, nil
 }
 
 func (ca *CAImpl) readCACert(certFile string) (*core.Certificate, error) {
